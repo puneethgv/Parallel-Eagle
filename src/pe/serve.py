@@ -19,6 +19,7 @@ Greedy acceptance makes the output identical to plain decoding (lossless).
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 import torch
 
@@ -48,6 +49,7 @@ def generate_speculative(
     tree_top_k: int = 3,
     tree_max_nodes: int = 24,
     eos_token_id: int | None = None,
+    on_commit: Callable[[list[int]], None] | None = None,
 ) -> GenResult:
     if mode not in _CHAIN_MODES and mode != "tree":
         raise ValueError(f"unknown mode {mode!r}")
@@ -103,6 +105,8 @@ def generate_speculative(
         seq.extend(committed)
         seq.append(bonus)
         featured_len = prefix_len + num_acc
+        if on_commit is not None:
+            on_commit([*committed, bonus])
         if eos_token_id is not None and (bonus == eos_token_id or eos_token_id in committed):
             stop = True
 
