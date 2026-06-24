@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 import torch
 
@@ -16,6 +17,7 @@ def vanilla_generate(
     prompt_ids: list[int],
     max_new_tokens: int,
     eos_token_id: int | None = None,
+    on_commit: Callable[[list[int]], None] | None = None,
 ) -> GenResult:
     seq = list(prompt_ids)
     base = len(seq)
@@ -25,6 +27,8 @@ def vanilla_generate(
         out = target.forward(ids)
         nxt = int(out.logits[0, -1].argmax())
         seq.append(nxt)
+        if on_commit is not None:
+            on_commit([nxt])
         if eos_token_id is not None and nxt == eos_token_id:
             break
     if target.device.type == "cuda":
