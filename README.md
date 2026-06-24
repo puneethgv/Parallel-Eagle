@@ -1,52 +1,67 @@
 # parallel_eagle
 
-A from-scratch **speculative decoder** whose draft model proposes many future tokens in a
-**single forward pass** and verifies a **branching tree** of candidates against the target in
-one pass — accelerating autoregressive generation while producing output that is provably
-identical to plain decoding.
+A from-scratch **speculative decoder** whose draft model proposes many future
+tokens in a **single forward pass** and verifies a **branching tree** of candidates
+against the target in one pass — accelerating autoregressive generation while
+producing output that is provably identical to plain decoding.
 
-The project is built to run on a single 8 GB consumer GPU. It implements the full pipeline:
-a frozen-target feature extractor, a feature-conditioned parallel drafter, a memory-scalable
-training recipe, lossless verification, and a benchmark harness that measures real
-wall-clock throughput against several baselines.
+Built to train and run on a single 8 GB consumer GPU. It implements the whole
+pipeline in PyTorch: a frozen-target feature extractor, a feature-conditioned
+parallel drafter, a memory-scalable training recipe, lossless verification, and a
+benchmark harness that measures acceptance length, call efficiency, and wall-clock.
 
 ## The idea in one paragraph
 
-Autoregressive decoding emits one token per target forward pass and is memory-bandwidth
-bound. *Speculative decoding* fixes this by having a cheap draft model propose several next
-tokens that the target verifies in a single pass; correct tokens are accepted "for free."
-This drafter is **feature-conditioned** — it consumes the target's own intermediate hidden
-states rather than raw tokens — so a tiny network can draft accurately. Crucially, it
-predicts all `K` tokens in **one parallel pass** instead of `K` sequential passes: the
-unknown future positions are filled with a single learnable *shared hidden state* and a
-learnable *mask-token embedding*, and positional structure is left to rotary attention. On
-top of that, drafting produces a **dynamic tree** of candidates (not a single chain), so one
+Autoregressive decoding emits one token per target forward pass and is
+memory-bandwidth bound. *Speculative decoding* fixes this: a cheap draft model
+proposes several next tokens that the target verifies in a single pass; correct
+tokens are accepted "for free." Here the drafter is **feature-conditioned** — it
+consumes the target's own intermediate hidden states rather than raw tokens — so a
+tiny network can draft accurately. Crucially it predicts all `K` tokens in **one
+parallel pass** instead of `K` sequential passes: the unknown future positions are
+filled with a single learnable *shared hidden state* and a learnable *mask-token
+embedding*, and positional structure is left to rotary attention. On top of that,
+drafting produces a **dynamic tree** of candidates (not a single chain), so one
 early mistake no longer throws away the whole draft.
 
-## Why it's interesting
+## How it works
 
-- **Parallel drafting** removes the per-token latency of sequential draft generation.
-- **Tree drafting + tree-attention verification** lifts the accepted-tokens-per-step well
-  above a single chain, at the cost of one bounded extra-wide target pass.
-- **Memory-scalable training** (amortized attention-mask construction + within-sequence
-  gradient accumulation) makes long-context drafter training fit in a small memory budget.
-- Everything is **lossless**: greedy outputs are token-identical to plain decoding, and
-  sampled outputs match the target distribution.
+**Feature-conditioned drafter.** For each position the drafter input is
+`in_proj(concat(token_embedding, feat_proj(target_features)))`, where
+`target_features` is a fusion of an early, a middle, and a late target layer. The
+token embedding and LM head are **shared with the frozen target** (no copy, no
+gradient). The mask representation that stands in for "future, unknown" positions
+is a dedicated learnable vector pair (`mask_emb`, `h_shared`) rather than an
+unfrozen vocabulary row — same effect, far less memory.
 
-## Architecture
+**Parallel multi-token prediction.** Predicting the `d`-th future token from a
+real position is a slot at rotary position `pos + d` filled with the shared
+hidden state / mask embedding. A single attention pass over the real stream plus
+these slots yields `K` token distributions at once. Depth is recoverable from
+position via rotary attention, so no depth-specific encoding is added.
 
-```
-            target (frozen)                         drafter (trained)
-   prompt ──► N decoder layers ──► fused hidden ──► concat(token emb, proj(features))
-                  │  (early/mid/late)                          │
-                  └─ LM head (tied, frozen) ◄── decoder stack ◄─┘
-                                                  ▲
-            depths 2..K filled with a shared hidden state + mask-token embedding
-                                                  │
-                              one pass ──► logits at K depths ──► draft tree
-                                                  │
-                target verifies the whole tree in one pass ──► accept longest valid path
-```
+**Dynamic tree drafting.** From the one drafter pass we have a distribution at each
+depth. Instead of committing to the top-1 chain, a beam keeps the highest
+joint-probability continuations — at each depth the top candidates are attached to
+every surviving parent and the beam is re-pruned. This concentrates branching where
+the drafter is uncertain and yields a compact tree the target verifies in one pass
+via a custom tree-attention mask.
+
+**Memory-scalable training.** Training expands each length-`n` sequence into `n·K`
+prediction slots, so attention cost grows with `(nK)²`. Two techniques keep this
+tractable:
+- *Amortized mask construction*: the cross-depth causal mask is position-invariant,
+  so it is built once at the maximum length and sliced (a constant-time view) per
+  batch.
+- *Sequence partitioning*: one sequence is split into `S` segments with gradients
+  accumulated across them, instantiating the prediction slots only for the current
+  segment. Because every depth of an anchor stays in the same segment, the
+  accumulated gradient is **exactly** the full-sequence gradient (verified in
+  tests), while the per-pass sequence length shrinks from `nK` toward `~2n`.
+
+**Lossless.** Greedy acceptance only ever commits the target's own argmax tokens,
+so the output is identical to plain greedy decoding regardless of draft quality
+(verified token-for-token in the test suite).
 
 ## Repository layout
 
@@ -55,47 +70,101 @@ src/pe/
   config.py     # configuration dataclasses
   target.py     # frozen target: fused hidden states + masked verification forward
   features.py   # offline feature extraction to disk shards
+  nn.py         # from-scratch transformer blocks (RMSNorm, RoPE, GQA, SwiGLU)
   drafter.py    # parallel multi-token drafter
   masks.py      # amortized training mask + tree attention mask
   partition.py  # sequence partitioning for within-sequence gradient accumulation
   train.py      # drafter training loop
   decode/
-    verify.py     # lossless acceptance (greedy + speculative sampling)
-    baselines.py  # vanilla AR; independent-draft SD; sequential feature-chain drafter
-    chain.py      # parallel chain drafting
-    tree.py       # parallel dynamic tree drafting + tree verification
-  serve.py      # generation entrypoint
-bench/          # benchmark sweep + plotting
-tests/          # CPU correctness tests (losslessness, mask equality)
+    verify.py     # lossless acceptance (chain + tree)
+    baselines.py  # vanilla autoregressive decoding
+    chain.py      # parallel chain + sequential chain drafting
+    tree.py       # parallel dynamic tree drafting
+  serve.py      # single-pass speculative generation loop
+bench/          # benchmark sweep, memory-scaling, plotting
+tests/          # CPU correctness tests (losslessness, mask + gradient equivalence)
 ```
 
 ## Install
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[train,dev]"     # add CUDA torch per your platform
+pip install -e ".[dev]"          # add CUDA torch per your platform; ".[train]" adds 8-bit Adam
 ```
 
 ## Quickstart
 
+The defaults target `Qwen/Qwen2.5-0.5B-Instruct` (open, fits 8 GB). Any causal LM
+with hidden states + an LM head works via `--target`.
+
 ```bash
-make features   # cache the frozen target's hidden states over the training data
-make train      # train the parallel drafter on the cached features
-make bench      # measure acceptance length + tokens/sec across strategies
-make test       # CPU correctness tests
+# 1) cache the frozen target's fused hidden states over training data
+python -m pe.features --target Qwen/Qwen2.5-0.5B-Instruct \
+    --dataset tatsu-lab/alpaca --split train --max-examples 3000 --max-seq-len 384
+
+# 2) train the parallel drafter (sequence partitioning keeps long contexts in 8 GB)
+python -m pe.train --target Qwen/Qwen2.5-0.5B-Instruct --dtype bfloat16 \
+    --num-layers 3 --max-depth 6 --max-seq-len 384 --epochs 6 \
+    --num-segments 6 --no-8bit-adam
+
+# 3) benchmark every strategy against vanilla greedy
+python bench/run_bench.py --target Qwen/Qwen2.5-0.5B-Instruct --k-values 3 5
+python bench/plot.py
+
+# memory-scaling demonstration of sequence partitioning
+python bench/mem_scaling.py --segments 1 2 3 6
 ```
 
 ## Results
 
-Benchmarked on a single 8 GB GPU. (Populated by `bench/run_bench.py` → `results/`.)
+Target `Qwen2.5-0.5B-Instruct`, a 3-layer drafter (`K_train=6`) trained on a single
+8 GB RTX 3070, greedy decoding, fp32, 10 held-out prompts, `K=5`
+(reproduce with `bench/run_bench.py`):
 
-| Strategy | Accept. length | Tokens/sec | Speedup vs vanilla | Lossless |
+| Strategy | Acceptance length | Target calls / token | Drafter calls / token | Lossless |
 |---|---|---|---|---|
-| Vanilla autoregressive | 1.00 | _tbd_ | 1.00× | — |
-| Independent-draft SD | _tbd_ | _tbd_ | _tbd_ | ✓ |
-| Sequential feature-chain | _tbd_ | _tbd_ | _tbd_ | ✓ |
-| Parallel chain | _tbd_ | _tbd_ | _tbd_ | ✓ |
-| **Parallel tree** | _tbd_ | _tbd_ | _tbd_ | ✓ |
+| vanilla autoregressive | 1.000 | 1.000 | 0.00 | ✓ |
+| sequential chain | 1.023 | 1.006 | 5.84 | ✓ |
+| parallel chain | 1.029 | 1.001 | 0.97 | ✓ |
+| **parallel dynamic tree** | **1.151** | **0.901** | 0.87 | ✓ |
+
+![benchmark](results/benchmark.png)
+
+Takeaways:
+- **Dynamic tree drafting lifts acceptance +12% over the chain** (1.151 vs 1.029) at
+  effectively the same drafter cost, and brings **target forward passes per token
+  below 1.0** (0.901) — a net reduction in target compute, losslessly.
+- **Parallel drafting is ~6× more call-efficient than sequential** (0.87 vs 5.84
+  drafter calls per token) — the cost that one-pass drafting removes.
+- Losslessness is exact: every strategy reproduces vanilla greedy token-for-token.
+
+**Memory scaling.** Training one 512-token example through the drafter, varying the
+number of sequence-partitioning segments `S` (`bench/mem_scaling.py`):
+
+| Segments `S` | Peak training memory |
+|---|---|
+| 1 | out of memory |
+| 2 | 5.1 GB |
+| 3 | 3.5 GB |
+| 6 | 2.0 GB |
+
+The loss is identical across `S` (the partitioned gradient equals the
+full-sequence gradient exactly), yet the context that **OOMs at `S=1` trains
+comfortably at `S=6`** — which is how long-context training fits an 8 GB card.
+
+**On wall-clock.** The generation loop recomputes the prefix each step (no KV
+cache), so absolute tokens/sec speedup is below 1 at this small, lightly-trained
+scale even though the tree already saves target *calls*. Acceptance length and
+call efficiency are the KV-cache-independent algorithmic results; wiring a KV cache
+(so wall-clock tracks target-calls-per-token) and training a larger drafter are the
+two levers to turn the call-efficiency win into a wall-clock win.
+
+## Tests
+
+```bash
+pytest          # losslessness, mask correctness, exact full-vs-partitioned gradients
+ruff check .
+```
 
 ## License
 
