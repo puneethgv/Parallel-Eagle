@@ -1,7 +1,11 @@
-.PHONY: install features train bench test lint format
+.PHONY: install quickstart features train bench test lint format
 
 install:
 	pip install -e ".[train,dev]"
+
+# Full pipeline on a toy model in seconds, CPU, no downloads (smoke check).
+quickstart:
+	python scripts/quickstart.py
 
 # Offline: run the frozen target over training data, cache fused hidden states.
 features:
