@@ -34,7 +34,7 @@ def main() -> None:
     print("training the drafter (a few steps on toy features)...")
     drafter.train()
     opt = torch.optim.AdamW(drafter.trainable_parameters(), lr=1e-3)
-    for step in range(30):
+    for _ in range(30):
         ids = torch.randint(0, target.vocab_size, (32,))
         feats = target.forward(ids.unsqueeze(0)).fused[0]
         opt.zero_grad(set_to_none=True)
