@@ -9,18 +9,20 @@ description = "Feature-conditioned parallel-drafting speculative decoder with dy
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
+# Tested with torch 2.12, transformers 5.12, datasets 5.0, accelerate 1.14, numpy 2.5.
+# transformers >= 5 is required (the KV-cache uses the 5.x DynamicCache.layers API).
 dependencies = [
-    "torch>=2.2",
-    "transformers>=4.44",
-    "datasets>=2.20",
-    "accelerate>=0.33",
-    "numpy",
-    "matplotlib",
+    "torch>=2.4",
+    "transformers>=5.0,<6",
+    "datasets>=3.0,<6",
+    "accelerate>=1.0,<2",
+    "numpy>=1.24,<3",
+    "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]
-train = ["bitsandbytes>=0.43"]
-dev = ["pytest>=8", "ruff>=0.6"]
+train = ["bitsandbytes>=0.43,<1"]
+dev = ["pytest>=8,<9", "ruff>=0.6"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
