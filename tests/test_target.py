@@ -29,3 +29,13 @@ def test_auto_feature_layers_include_near_final():
     layers = TargetModel._resolve_feature_layers(None, 24)
     assert len(set(layers)) == 3
     assert max(layers) >= 20
+
+
+def test_final_norm_lookup_is_architecture_agnostic(tiny_target):
+    # The drafter shares the target's final norm; locating it must not depend on a
+    # hardcoded ``model.model.norm`` path.
+    from pe.target import _final_norm_module
+
+    nm = _final_norm_module(tiny_target.model)
+    assert hasattr(nm, "weight")
+    assert tiny_target.get_final_norm() is nm

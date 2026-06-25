@@ -38,6 +38,20 @@ def _load_target_model(cfg: TargetConfig, dtype):
     return AutoModelForCausalLM.from_pretrained(cfg.model_name, dtype=dtype), False
 
 
+def _final_norm_module(model) -> torch.nn.Module:
+    """Locate the decoder's final norm across model families (Llama/Mistral/Qwen/
+    Gemma use ``norm``; others may use ``final_layernorm`` / ``ln_f``)."""
+    base = model.get_decoder() if hasattr(model, "get_decoder") else getattr(model, "model", model)
+    for name in ("norm", "final_layernorm", "ln_f"):
+        nm = getattr(base, name, None)
+        if nm is not None:
+            return nm
+    raise ValueError(
+        f"Could not locate a final norm on {type(model).__name__}; "
+        "this target architecture is not supported."
+    )
+
+
 def materialize_fp16_weight(module: torch.nn.Module) -> torch.Tensor:
     """Return a plain fp16 weight for a linear/embedding, dequantizing 4-bit if needed."""
     w = module.weight
@@ -142,7 +156,7 @@ class TargetModel:
     def get_final_norm(self) -> torch.nn.Module:
         """The target's final RMSNorm — shared (frozen) so the drafter's output is
         in exactly the scale the LM head expects."""
-        return self.model.model.norm
+        return _final_norm_module(self.model)
 
     def _fuse(self, hidden_states: tuple[torch.Tensor, ...]) -> torch.Tensor:
         return torch.cat([hidden_states[i] for i in self.feature_layers], dim=-1)
@@ -273,7 +287,7 @@ def dump_target_heads(model, path) -> None:
         {
             "embed": materialize_fp16_weight(model.get_input_embeddings()),
             "head": materialize_fp16_weight(model.get_output_embeddings()),
-            "norm": model.model.norm.weight.data.to(torch.float16).cpu(),
+            "norm": materialize_fp16_weight(_final_norm_module(model)),
         },
         path,
     )
@@ -305,7 +319,7 @@ def load_target_heads(cfg: TargetConfig) -> TargetHeads:
         config,
         materialize_fp16_weight(model.get_input_embeddings()),
         materialize_fp16_weight(model.get_output_embeddings()),
-        model.model.norm.weight.data.to(torch.float16),
+        materialize_fp16_weight(_final_norm_module(model)),
         feature_layers,
         cfg.device,
         dtype,
