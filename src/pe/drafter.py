@@ -55,6 +55,12 @@ class ParallelDrafter(nn.Module):
         self.max_depth = max_depth
         self.vocab = vocab
 
+        self.feature_dim = feature_dim
+        self.num_feature_layers = feature_dim // hidden
+        # Target hidden states carry "massive activations" (a few dims with huge
+        # magnitude) and differ in scale across layers; normalize each fused layer
+        # block before projection so training is stable.
+        self.feat_norm = RMSNorm(hidden, eps)
         self.feat_proj = nn.Linear(feature_dim, hidden, bias=False)
         self.in_proj = nn.Linear(2 * hidden, hidden, bias=False)
         self.mask_emb = nn.Parameter(torch.zeros(hidden))
@@ -113,9 +119,11 @@ class ParallelDrafter(nn.Module):
         return self._lm_head[0](hidden)
 
     def real_input(self, token_ids: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
-        """Input vector for real positions: ``in_proj([emb(token); proj(feat)])``."""
+        """Input vector for real positions: ``in_proj([emb(token); proj(norm(feat))])``."""
         emb = self._embed_tokens(token_ids).to(self.param_dtype)
-        feat = self.feat_proj(features.to(self.param_dtype))
+        f = features.to(self.param_dtype)
+        f = self.feat_norm(f.unflatten(-1, (self.num_feature_layers, self.hidden)))
+        feat = self.feat_proj(f.flatten(-2))
         return self.in_proj(torch.cat([emb, feat], dim=-1))
 
     def mask_input(self, n: int) -> torch.Tensor:
