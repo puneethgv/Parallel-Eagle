@@ -56,29 +56,100 @@ def _example_to_prompt_ids(example: dict, tokenizer, max_len: int) -> torch.Tens
 
 
 @torch.no_grad()
+def _featurize(target: TargetModel, full: list[int], prompt_len: int):
+    """Run the frozen target once over the unpadded ``[prompt | response]`` and
+    return ``(full_ids, features_fp16_cpu, prompt_len, labels)``.
+
+    Unpadded so the cached features carry the exact positions/RoPE the drafter sees
+    at inference. ``labels[p]`` is the target's argmax *at* position ``p`` (its
+    teacher-forced next-token prediction) from the **same** forward as the features —
+    so features and labels are mutually consistent. Training derives the supervision
+    from these labels (not the generated token), which makes the objective exactly
+    "predict the target's argmax" regardless of how the sequence was produced (and
+    so robust to batched left-padding / cached-vs-full numerical ties)."""
+    ids_dev = torch.tensor(full, device=target.device).unsqueeze(0)
+    out = target.forward(ids_dev)
+    feats = out.fused[0].to(torch.float16).cpu()
+    labels = out.logits[0].argmax(-1).to(torch.long).cpu()
+    return torch.tensor(full, dtype=torch.long), feats, prompt_len, labels
+
+
+@torch.no_grad()
 def distill_example(
     target: TargetModel,
     prompt_ids: torch.Tensor,
     max_new_tokens: int,
     eos_token_id: int | None,
-) -> tuple[torch.Tensor, torch.Tensor, int] | None:
+) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor] | None:
     """Generate the target's greedy continuation of ``prompt_ids`` and featurize the
     full ``[prompt | response]`` sequence.
 
-    Returns ``(full_ids, features_fp16_cpu, prompt_len)`` or ``None`` if the target
-    produced no new tokens (e.g. immediate EOS), which carries no training signal.
+    Returns ``(full_ids, features_fp16_cpu, prompt_len, labels)`` or ``None`` if the
+    target produced no new tokens (e.g. immediate EOS), which carries no training
+    signal.
     """
     prompt = [int(t) for t in prompt_ids.tolist()]
     res = vanilla_generate_cached(target, prompt, max_new_tokens, eos_token_id=eos_token_id)
     if not res.output_ids:
         return None
-    full = prompt + res.output_ids
-    ids_dev = torch.tensor(full, device=target.device).unsqueeze(0)
-    feats = target.forward(ids_dev).fused[0].to(torch.float16).cpu()
-    return torch.tensor(full, dtype=torch.long), feats, len(prompt)
+    return _featurize(target, prompt + res.output_ids, len(prompt))
 
 
-def build_distill_dataset(dcfg: DistillConfig, tcfg: TargetConfig) -> Path:
+@torch.no_grad()
+def distill_batch(
+    target: TargetModel,
+    prompts: list[torch.Tensor],
+    max_new_tokens: int,
+    eos_token_id: int | None,
+) -> list[tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]]:
+    """Batched greedy generation for a list of prompts, then per-example unpadded
+    featurization.
+
+    Only the autoregressive generation (the expensive part — ``max_new_tokens``
+    forwards) is batched, via the target's HF ``.generate`` with left padding;
+    feature extraction stays per-example and unpadded so positions are inference-
+    exact. Left-padding can flip the occasional near-tie token versus unpadded
+    decoding, but training supervises on the unpadded teacher-forced argmax (see
+    :func:`_featurize`), so the per-example labels are exact regardless. Examples
+    with no generated tokens are dropped.
+    """
+    tok = target.tokenizer
+    dev = target.device
+    pad_id = getattr(tok, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = eos_token_id if eos_token_id is not None else 0
+
+    maxlen = max(p.shape[0] for p in prompts)
+    input_ids = torch.full((len(prompts), maxlen), pad_id, dtype=torch.long)
+    attn = torch.zeros((len(prompts), maxlen), dtype=torch.long)
+    for i, p in enumerate(prompts):  # left-pad so all real tokens are right-aligned
+        input_ids[i, maxlen - p.shape[0] :] = p
+        attn[i, maxlen - p.shape[0] :] = 1
+
+    gen = target.model.generate(
+        input_ids=input_ids.to(dev),
+        attention_mask=attn.to(dev),
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        num_beams=1,
+        pad_token_id=pad_id,
+        eos_token_id=eos_token_id,
+    )
+
+    out: list[tuple[torch.Tensor, torch.Tensor, int]] = []
+    for i, p in enumerate(prompts):
+        resp: list[int] = []
+        for t in gen[i, maxlen:].tolist():  # generated tokens follow the padded prompt block
+            if eos_token_id is not None and t == eos_token_id:
+                break
+            resp.append(int(t))
+        if not resp:
+            continue
+        out.append(_featurize(target, [int(x) for x in p.tolist()] + resp, p.shape[0]))
+    return out
+
+
+def build_distill_dataset(dcfg: DistillConfig, tcfg: TargetConfig, batch_size: int = 1) -> Path:
     from datasets import load_dataset
 
     target = TargetModel(tcfg)
@@ -105,22 +176,40 @@ def build_distill_dataset(dcfg: DistillConfig, tcfg: TargetConfig) -> Path:
         shards.append(name)
         buf = []
 
+    def record(results):
+        nonlocal n_done
+        for full_ids, feats, prompt_len, labels in results:
+            buf.append(
+                {
+                    "input_ids": full_ids,
+                    "features": feats,
+                    "prompt_len": prompt_len,
+                    "labels": labels,
+                }
+            )
+            n_done += 1
+            if len(buf) >= dcfg.shard_size:
+                flush()
+            if n_done % 50 == 0:
+                print(f"distilled {n_done}/{dcfg.max_examples}")
+
+    pending: list[torch.Tensor] = []
     for example in ds:
-        if n_done >= dcfg.max_examples:
+        if n_done + len(pending) >= dcfg.max_examples:
             break
         prompt_ids = _example_to_prompt_ids(example, tokenizer, dcfg.max_prompt_len)
         if prompt_ids is None:
             continue
-        out = distill_example(target, prompt_ids, dcfg.max_new_tokens, eos_token_id)
-        if out is None:
+        if batch_size <= 1:
+            out = distill_example(target, prompt_ids, dcfg.max_new_tokens, eos_token_id)
+            record([out] if out is not None else [])
             continue
-        full_ids, feats, prompt_len = out
-        buf.append({"input_ids": full_ids, "features": feats, "prompt_len": prompt_len})
-        n_done += 1
-        if len(buf) >= dcfg.shard_size:
-            flush()
-        if n_done % 50 == 0:
-            print(f"distilled {n_done}/{dcfg.max_examples}")
+        pending.append(prompt_ids)
+        if len(pending) >= batch_size:
+            record(distill_batch(target, pending, dcfg.max_new_tokens, eos_token_id))
+            pending = []
+    if pending:  # final partial batch
+        record(distill_batch(target, pending, dcfg.max_new_tokens, eos_token_id))
     flush()
 
     manifest = {
@@ -136,7 +225,7 @@ def build_distill_dataset(dcfg: DistillConfig, tcfg: TargetConfig) -> Path:
     return out_dir / "manifest.json"
 
 
-def _parse_args() -> tuple[DistillConfig, TargetConfig]:
+def _parse_args() -> tuple[DistillConfig, TargetConfig, int]:
     d, t = DistillConfig(), TargetConfig()
     p = argparse.ArgumentParser(description="Generate self-distilled drafter training data.")
     p.add_argument("--target", default=t.model_name)
@@ -146,6 +235,7 @@ def _parse_args() -> tuple[DistillConfig, TargetConfig]:
     p.add_argument("--max-prompt-len", type=int, default=d.max_prompt_len)
     p.add_argument("--max-new-tokens", type=int, default=d.max_new_tokens)
     p.add_argument("--shard-size", type=int, default=d.shard_size)
+    p.add_argument("--batch-size", type=int, default=1, help="batch greedy generation (>1)")
     p.add_argument("--out-dir", default=str(d.out_dir))
     p.add_argument("--device", default=t.device)
     a = p.parse_args()
@@ -159,9 +249,9 @@ def _parse_args() -> tuple[DistillConfig, TargetConfig]:
         shard_size=a.shard_size,
     )
     tcfg = TargetConfig(model_name=a.target, device=a.device)
-    return dcfg, tcfg
+    return dcfg, tcfg, a.batch_size
 
 
 if __name__ == "__main__":
-    dcfg, tcfg = _parse_args()
-    build_distill_dataset(dcfg, tcfg)
+    dcfg, tcfg, batch_size = _parse_args()
+    build_distill_dataset(dcfg, tcfg, batch_size=batch_size)

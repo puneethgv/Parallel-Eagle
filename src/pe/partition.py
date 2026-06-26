@@ -62,6 +62,7 @@ def mtp_backward(
     num_segments: int = 1,
     loss_scale: float = 1.0,
     prompt_len: int = 0,
+    teacher_labels: torch.Tensor | None = None,
 ) -> float:
     """Compute the per-depth cross-entropy and accumulate gradients.
 
@@ -70,10 +71,18 @@ def mtp_backward(
     masks slots whose label falls in the prompt region (``tgt < prompt_len``) out
     of the loss — for self-distilled data, only response-region labels equal the
     target's argmax and carry the acceptance-optimizing signal.
+
+    ``teacher_labels`` (self-distilled caches): ``teacher_labels[p]`` is the
+    target's argmax *at* position ``p``, so the supervision for predicting the
+    token at position ``tgt`` is ``teacher_labels[tgt - 1]`` — the exact "predict
+    the target's argmax" objective, from the same forward as the features. When
+    ``None`` the next sequence token ``input_ids[tgt]`` is used (human-text caches).
     """
     dev = drafter.device
     input_ids = input_ids.to(dev)
     features = features.to(dev)
+    if teacher_labels is not None:
+        teacher_labels = teacher_labels.to(dev)
     n = input_ids.shape[0]
     k = drafter.max_depth
     total_valid = max(1, _total_valid_after(n, k, prompt_len))
@@ -92,7 +101,11 @@ def mtp_backward(
         tgt = anchor + 1 + depth
         is_loss_slot = (anchor >= a0) & (tgt < n) & (tgt >= prompt_len)
         labels = torch.full_like(anchor, -100)
-        labels[is_loss_slot] = input_ids[tgt[is_loss_slot]]
+        slot_tgt = tgt[is_loss_slot]
+        if teacher_labels is not None:
+            labels[is_loss_slot] = teacher_labels[slot_tgt - 1]
+        else:
+            labels[is_loss_slot] = input_ids[slot_tgt]
 
         valid = labels != -100
         if not bool(valid.any()):

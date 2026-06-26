@@ -117,10 +117,12 @@ class FeatureDataset:
     """Iterates cached ``(input_ids, features)`` examples across shards.
 
     With ``with_prompt_len=True`` each item is a ``(input_ids, features,
-    prompt_len)`` triple instead; ``prompt_len`` is the number of leading prompt
-    tokens (0 when the shard predates self-distillation), used to mask the prompt
-    region out of the training loss. Self-distilled caches set ``self_distilled``
-    in the manifest and record a per-example ``prompt_len``.
+    prompt_len, labels)`` tuple instead; ``prompt_len`` is the number of leading
+    prompt tokens (0 when the shard predates self-distillation), used to mask the
+    prompt region out of the training loss, and ``labels`` is the target's
+    teacher-forced argmax per position (``None`` for human-text caches, which train
+    on the next token). Self-distilled caches set ``self_distilled`` in the
+    manifest and record a per-example ``prompt_len`` + ``labels``.
     """
 
     def __init__(self, cache_dir: str | Path, with_prompt_len: bool = False):
@@ -145,7 +147,12 @@ class FeatureDataset:
         for shard in self.manifest["shards"]:
             for ex in torch.load(self.dir / shard, weights_only=False):
                 if self.with_prompt_len:
-                    yield ex["input_ids"], ex["features"], int(ex.get("prompt_len", 0))
+                    yield (
+                        ex["input_ids"],
+                        ex["features"],
+                        int(ex.get("prompt_len", 0)),
+                        ex.get("labels"),
+                    )
                 else:
                     yield ex["input_ids"], ex["features"]
 

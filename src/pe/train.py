@@ -73,9 +73,11 @@ def train(tcfg: TargetConfig, dcfg: DrafterConfig, tr: TrainConfig, dtype: str =
     opt.zero_grad(set_to_none=True)
 
     for epoch in range(tr.epochs):
-        for input_ids, features, prompt_len in data:
+        for input_ids, features, prompt_len, labels in data:
             input_ids = input_ids[: tr.max_seq_len]
             features = features[: tr.max_seq_len]
+            if labels is not None:
+                labels = labels[: tr.max_seq_len]
             if input_ids.shape[0] < 2:
                 continue
 
@@ -86,6 +88,7 @@ def train(tcfg: TargetConfig, dcfg: DrafterConfig, tr: TrainConfig, dtype: str =
                 tr.num_segments,
                 loss_scale=1.0 / tr.grad_accum,
                 prompt_len=min(prompt_len, input_ids.shape[0]),
+                teacher_labels=labels,
             )
             micro += 1
             if micro % tr.grad_accum != 0:
