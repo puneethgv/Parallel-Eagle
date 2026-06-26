@@ -1,4 +1,4 @@
-.PHONY: install quickstart features train bench test lint format
+.PHONY: install quickstart features distill train bench test lint format
 
 install:
 	pip install -e ".[train,dev]"
@@ -10,6 +10,11 @@ quickstart:
 # Offline: run the frozen target over training data, cache fused hidden states.
 features:
 	python -m pe.features
+
+# Self-distillation: cache features over the target's OWN greedy generations, so
+# the training label equals the target's argmax (directly optimizes acceptance).
+distill:
+	python -m pe.distill
 
 # Train the parallel drafter on cached features.
 train:

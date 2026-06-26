@@ -33,6 +33,11 @@ def _total_valid(n: int, k: int) -> int:
     return sum(1 for i in range(n) for d in range(k) if i + 1 + d < n)
 
 
+def _total_valid_after(n: int, k: int, prompt_len: int = 0) -> int:
+    # like _total_valid, but only slots whose target token is in the response region
+    return sum(1 for i in range(n) for d in range(k) if prompt_len <= i + 1 + d < n)
+
+
 def _segment_slots(a0: int, a1: int, k: int, device):
     """Anchors/depths for one segment: real prefix 0..a1-1 plus segment MTP slots."""
     anchor_real = torch.arange(a1, device=device)
@@ -56,18 +61,22 @@ def mtp_backward(
     features: torch.Tensor,
     num_segments: int = 1,
     loss_scale: float = 1.0,
+    prompt_len: int = 0,
 ) -> float:
     """Compute the per-depth cross-entropy and accumulate gradients.
 
     Returns the mean loss (for logging). Gradients are left on the drafter's
-    parameters; the caller is responsible for the optimizer step.
+    parameters; the caller is responsible for the optimizer step. ``prompt_len``
+    masks slots whose label falls in the prompt region (``tgt < prompt_len``) out
+    of the loss — for self-distilled data, only response-region labels equal the
+    target's argmax and carry the acceptance-optimizing signal.
     """
     dev = drafter.device
     input_ids = input_ids.to(dev)
     features = features.to(dev)
     n = input_ids.shape[0]
     k = drafter.max_depth
-    total_valid = max(1, _total_valid(n, k))
+    total_valid = max(1, _total_valid_after(n, k, prompt_len))
 
     loss_sum = 0.0
     for a0, a1 in _segment_bounds(n, num_segments):
@@ -81,7 +90,7 @@ def mtp_backward(
         hidden = drafter(x.unsqueeze(0), pos, bias)[0]
 
         tgt = anchor + 1 + depth
-        is_loss_slot = (anchor >= a0) & (tgt < n)
+        is_loss_slot = (anchor >= a0) & (tgt < n) & (tgt >= prompt_len)
         labels = torch.full_like(anchor, -100)
         labels[is_loss_slot] = input_ids[tgt[is_loss_slot]]
 

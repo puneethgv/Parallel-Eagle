@@ -89,6 +89,26 @@ class FeatureConfig:
 
 
 @dataclass
+class DistillConfig:
+    """Self-distillation feature generation.
+
+    Instead of caching features over human-written responses, run the target's
+    *own* greedy generation on each prompt and cache features over
+    ``[prompt | target response]``. The training label at each response position
+    then equals the target's argmax — exactly what decode-time acceptance
+    measures — so training directly optimizes acceptance length.
+    """
+
+    out_dir: Path = Path("distill_cache")
+    dataset: str = "tatsu-lab/alpaca"
+    split: str = "train"
+    max_examples: int = 2000
+    max_prompt_len: int = 512  # truncate the user prompt to this many tokens
+    max_new_tokens: int = 256  # cap on the target's generated response length
+    shard_size: int = 256
+
+
+@dataclass
 class DecodeConfig:
     """Inference / speculation settings shared by the decode strategies."""
 

@@ -46,7 +46,9 @@ def train(tcfg: TargetConfig, dcfg: DrafterConfig, tr: TrainConfig, dtype: str =
     torch.manual_seed(tr.seed)
     param_dtype = _DTYPES[dtype]
 
-    data = FeatureDataset(tr.feature_cache_dir)
+    data = FeatureDataset(tr.feature_cache_dir, with_prompt_len=True)
+    if data.self_distilled:
+        print("self-distilled cache detected — masking prompt region out of the loss")
     if data.heads_dump.exists():
         # Lean path: rebuild shared embed/LM head from the dump (no model, no
         # quantization library) — essential for the 7B int4 target.
@@ -71,14 +73,19 @@ def train(tcfg: TargetConfig, dcfg: DrafterConfig, tr: TrainConfig, dtype: str =
     opt.zero_grad(set_to_none=True)
 
     for epoch in range(tr.epochs):
-        for input_ids, features in data:
+        for input_ids, features, prompt_len in data:
             input_ids = input_ids[: tr.max_seq_len]
             features = features[: tr.max_seq_len]
             if input_ids.shape[0] < 2:
                 continue
 
             running += mtp_backward(
-                drafter, input_ids, features, tr.num_segments, loss_scale=1.0 / tr.grad_accum
+                drafter,
+                input_ids,
+                features,
+                tr.num_segments,
+                loss_scale=1.0 / tr.grad_accum,
+                prompt_len=min(prompt_len, input_ids.shape[0]),
             )
             micro += 1
             if micro % tr.grad_accum != 0:
