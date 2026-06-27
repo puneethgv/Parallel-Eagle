@@ -2,6 +2,11 @@
 
 [![CI](https://github.com/puneethgv/parallel_eagle/actions/workflows/ci.yml/badge.svg)](https://github.com/puneethgv/parallel_eagle/actions/workflows/ci.yml)
 
+![naive vs. parallel-tree speculative decoding on an fp16 14B target — identical output, but the tree commits accepted tokens in multi-token bursts and finishes first](docs/demo.gif)
+
+*Left: ordinary autoregressive decoding, one token per step. Right: the parallel-tree
+drafter, committing accepted tokens in bursts — same output, ~1.3× faster on the 14B.*
+
 A from-scratch **speculative decoder** whose draft model proposes many future
 tokens in a **single forward pass** and verifies a **branching tree** of candidates
 against the target in one pass — accelerating autoregressive generation while
@@ -265,14 +270,10 @@ runs on the 15-epoch drafter (`bench/demo_race.py probe`):
 | "Explain how a CPU…" (prose) | 1.40 | 0.83× |
 
 So on structured generation — exactly where speculative decoding is most useful — the
-parallel drafter is a clear **~1.3× faster, losslessly**. The live side-by-side makes it
-visible (`make demo` / `bench/demo_race.py`):
-
-![naive vs. parallel-tree decoding on the 14B target](docs/demo.gif)
-
-Left is plain autoregressive decoding (one token per step); right is the parallel-tree
-loop, committing accepted tokens in multi-token **bursts** and finishing the function
-first. The two outputs are token-for-token identical.
+parallel drafter is a clear **~1.3× faster, losslessly**. The side-by-side demo at the
+top of this README shows it live: plain autoregressive decoding on the left, the
+parallel-tree loop committing multi-token **bursts** on the right, finishing the
+function first with token-for-token identical output (`make demo` / `bench/demo_race.py`).
 
 A per-depth diagnostic (`bench/diagnose_acceptance.py`) explains the trajectory: the
 drafter's depth-0 (next-token) accuracy is already strong at **0.765**, but accuracy
