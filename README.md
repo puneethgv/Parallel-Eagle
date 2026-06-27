@@ -1,4 +1,4 @@
-# parallel_eagle
+# parallel Eagle
 
 [![CI](https://github.com/puneethgv/parallel_eagle/actions/workflows/ci.yml/badge.svg)](https://github.com/puneethgv/parallel_eagle/actions/workflows/ci.yml)
 
