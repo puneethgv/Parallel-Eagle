@@ -30,6 +30,8 @@ wandb/
 # Benchmark scratch output (curated results live under results/ and are tracked)
 bench_out/
 *.log
+*.cast
+docs/demo_preview.gif
 
 # OS / editor
 .DS_Store

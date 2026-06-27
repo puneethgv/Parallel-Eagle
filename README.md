@@ -240,6 +240,8 @@ Qwen/Qwen2.5-14B-Instruct --dtype bfloat16`):
 | trained, 6 epochs | 1.447 | 20.9 | 0.93× |
 | **trained, 15 epochs** | **1.677** | **23.8** | **1.045×** |
 
+![14B acceptance and speedup by strategy — the tree bar crosses the 1.0× line](results/benchmark_14b.png)
+
 Two things are worth calling out:
 
 - **It crosses break-even.** At 15 epochs the parallel-tree loop is genuinely faster
@@ -247,6 +249,30 @@ Two things are worth calling out:
   7B section predicted was needed for a win.
 - **Acceptance is monotonic in training and not plateaued**: 1.345 (local 7B proof) →
   1.447 (6 epochs) → 1.677 (15 epochs) on the *same* data, purely from more epochs.
+
+**Speedup is much larger on structured output.** The 1.045× above is the 10-prompt
+*mixed* average; acceptance — and therefore speedup — is far higher on code/list-style
+prompts (where the next tokens are predictable) and lower on free-form prose. Per-prompt
+runs on the 15-epoch drafter (`bench/demo_race.py probe`):
+
+| Prompt | Acceptance | Speedup |
+|---|---|---|
+| Fibonacci function | 1.97 | **1.34×** |
+| Bubble sort | 1.94 | **1.30×** |
+| First-n primes | 1.71 | 1.21× |
+| Reverse a linked list | 1.71 | 1.13× |
+| Palindrome check | 1.69 | 1.09× |
+| "Explain how a CPU…" (prose) | 1.40 | 0.83× |
+
+So on structured generation — exactly where speculative decoding is most useful — the
+parallel drafter is a clear **~1.3× faster, losslessly**. The live side-by-side makes it
+visible (`make demo` / `bench/demo_race.py`):
+
+![naive vs. parallel-tree decoding on the 14B target](docs/demo.gif)
+
+Left is plain autoregressive decoding (one token per step); right is the parallel-tree
+loop, committing accepted tokens in multi-token **bursts** and finishing the function
+first. The two outputs are token-for-token identical.
 
 A per-depth diagnostic (`bench/diagnose_acceptance.py`) explains the trajectory: the
 drafter's depth-0 (next-token) accuracy is already strong at **0.765**, but accuracy

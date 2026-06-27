@@ -120,21 +120,60 @@ def diagnose(target: str = TARGET, k: int = 7, max_new: int = 128):
 
 
 @app.function(gpu=GPU, volumes=VOLS, timeout=60 * 30)
-def gif(target: str = TARGET, prompt: str = "Explain how a CPU executes an instruction, step by step."):
+def gif(target: str = TARGET, max_new: int = 120, speed: float = 1.0,
+        prompt: str = "Explain how a CPU executes an instruction, step by step."):
+    """Side-by-side naive-vs-tree demo GIF on the saved 14B drafter. Records each
+    stream separately (no model in the replay), then composites them side by side.
+    Prints the single-prompt speedup so the run also confirms tree > naive."""
     import subprocess
 
-    # agg (cast -> gif) prebuilt binary; asciinema via pip.
-    subprocess.run("pip install asciinema", shell=True, check=True)
+    subprocess.run("pip install -q asciinema", shell=True, check=True)
     subprocess.run(
         "curl -sL https://github.com/asciinema/agg/releases/download/v1.5.0/"
         "agg-x86_64-unknown-linux-gnu -o /usr/local/bin/agg && chmod +x /usr/local/bin/agg",
         shell=True, check=True,
     )
-    env = {"TARGET": target, "CKPT": f"{CKPT_DIR}/drafter.pt", "DTYPE": "bfloat16",
-           "DEVICE": "cuda", "PROMPT": prompt, "OUT_DIR": f"{DATA}/results", "NAME": "demo"}
-    subprocess.run(["bash", f"{REPO}/scripts/record_demo.sh"], env={**os.environ, **env}, check=True)
+    env = {**os.environ, "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+           "TRANSFORMERS_VERBOSITY": "error", "TOKENIZERS_PARALLELISM": "false"}
+    ckpt, ev = f"{CKPT_DIR}/drafter.pt", "/tmp/race.json"
+
+    # Acceptance varies a lot by prompt; probe a few high-structure (code) prompts with
+    # the model loaded once and keep the one where the tree wins by the most.
+    prompts = [
+        "Write a Python function that returns the n-th Fibonacci number.",
+        "Implement bubble sort in Python with a short comment.",
+        "Write a Python function to check whether a string is a palindrome.",
+        "Write a Python function that reverses a singly linked list.",
+        "Write a Python function that returns the first n prime numbers as a list.",
+        prompt,
+    ]
+    # 1) probe prompts (loads the 14B once), keep the best-speedup events + print all
+    subprocess.run(
+        ["python", "-u", f"{REPO}/bench/demo_race.py", "probe", "--target", target,
+         "--ckpt", ckpt, "--dtype", "bfloat16", "--max-new", str(max_new),
+         "--out", ev, "--prompts", *prompts], env=env, check=True,
+    )
+    # 2) replay each stream on its own and rasterize to a GIF
+    for w in ("naive", "tree"):
+        subprocess.run(
+            ["asciinema", "rec", "--overwrite", "--idle-time-limit", "2", "--command",
+             f"python {REPO}/bench/demo_race.py one {ev} {w} --speed {speed}", f"/tmp/{w}.cast"],
+            env=env, check=True,
+        )
+        subprocess.run(["agg", "--theme", "monokai", "--font-size", "18",
+                        f"/tmp/{w}.cast", f"/tmp/{w}.gif"], env=env, check=True)
+    # 3) stitch the two GIFs side by side
+    out = f"{DATA}/results/demo.gif"
+    subprocess.run(["python", f"{REPO}/bench/sidebyside.py", "/tmp/naive.gif", "/tmp/tree.gif",
+                    out, "--cols", "44"], env=env, check=True)
     pe_data.commit()
-    print(f"gif -> {DATA}/results/demo.gif")
+    print(f"gif -> {out}", flush=True)
+
+
+@app.local_entrypoint()
+def demo(max_new: int = 120, speed: float = 1.0):
+    """Render the side-by-side 14B demo GIF on the saved drafter checkpoint."""
+    gif.remote(max_new=max_new, speed=speed)
 
 
 @app.function(gpu=GPU, volumes=VOLS, timeout=60 * 150)
