@@ -16,8 +16,9 @@ env/
 
 # Large / regenerable artifacts
 data/
-features_cache/
-checkpoints/
+features_cache*/
+distill_cache*/
+checkpoints*/
 models/
 runs/
 wandb/
